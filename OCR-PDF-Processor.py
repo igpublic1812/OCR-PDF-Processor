@@ -10,21 +10,32 @@ import os
 # ------------------------------------------------------------------
 s3 = boto3.client('s3')
 BUCKET = 's3-1812-pdf'          # <-- your S3 bucket name
-BUILD_VERSION = "1.1.0"         # <-- updated Lambda build version
+BUILD_VERSION = "1.1.4"         # <-- fixed tuple key + added logging
 # ------------------------------------------------------------------
 
+
 def lambda_handler(event, context):
-    # 1️⃣ Get the uploaded PDF key
-    key = event['Records'][0]['s3']['object']['key']
+    # --------------------------------------------------------------
+    # 1️⃣ Get the uploaded PDF key safely and log raw value
+    # --------------------------------------------------------------
+    raw_key = event['Records'][0]['s3']['object']['key']
+    print(f"[DEBUG] Raw key from event: {repr(raw_key)} (type: {type(raw_key)})")
+
+    if isinstance(raw_key, tuple):
+        key = raw_key[0]
+    else:
+        key = str(raw_key)
+
     print(f"[INFO] Processing file: {key}")
 
-    # 2️⃣ Download PDF from S3 into memory
+    # --------------------------------------------------------------
+    # 2️⃣ Download PDF from S3
+    # --------------------------------------------------------------
     pdf_data = s3.get_object(Bucket=BUCKET, Key=key)['Body'].read()
-
-    # 3️⃣ Open PDF
     doc = fitz.open(stream=pdf_data, filetype="pdf")
 
     result = {
+        "FormNumber": "",
         "A-Number": "",
         "LastName": "",
         "FirstName": "",
@@ -32,29 +43,38 @@ def lambda_handler(event, context):
         "Status": "Processed"
     }
 
+    # --------------------------------------------------------------
+    # 3️⃣ Process first page only
+    # --------------------------------------------------------------
     page = doc[0]
-
-    # --------------------------------------------------------------
-    # 4️⃣ Try extracting text layer first
-    # --------------------------------------------------------------
     page_text = page.get_text("text")
+
     if not page_text.strip():
-        # fallback to OCR
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        # Enhance OCR accuracy
-        img = img.convert('L')  # grayscale
-        img = img.point(lambda x: 0 if x < 180 else 255, '1')  # threshold
+        img = img.convert('L')
+        img = img.point(lambda x: 0 if x < 180 else 255, '1')
         page_text = pytesseract.image_to_string(img, lang='eng')
 
-    # Clean text (keep basic ASCII)
+    # Clean up text
     page_text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E]', '', page_text)
-    print("----- CLEANED PAGE TEXT -----")
-    print(page_text)
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+
+    print("----- PAGE LINES (debug) -----")
+    for idx, line in enumerate(lines):
+        print(f"{idx:03}: {line}")
     print("------------------------------")
 
     # --------------------------------------------------------------
-    # 5️⃣ Extract A-Number (digits only)
+    # 4️⃣ Extract Form Number (e.g., I-485, I-131)
+    # --------------------------------------------------------------
+    form_match = re.search(r'\bForm\s+(I-\d{1,4}[A-Z]?)', page_text, re.I)
+    if form_match:
+        result['FormNumber'] = form_match.group(1)
+        print(f"[Form Detected]: {result['FormNumber']}")
+
+    # --------------------------------------------------------------
+    # 5️⃣ Extract A-Number
     # --------------------------------------------------------------
     a_match = re.search(r'A[-\s]*Number.*?([0-9\s]{2,})', page_text, re.I)
     if a_match:
@@ -63,33 +83,30 @@ def lambda_handler(event, context):
         print(f"[A-Number Detected]: {result['A-Number']}")
 
     # --------------------------------------------------------------
-    # 6️⃣ Extract Name Fields (line-based, OCR-safe)
+    # 6️⃣ Extract Name fields using line proximity
     # --------------------------------------------------------------
-    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-
-    # Find the header line
-    header_idx = None
     for i, line in enumerate(lines):
-        if re.search(r'Family\s*Name\s*\(Last\s*Name\).*Given\s*Name.*Middle\s*Name', line, re.I):
-            header_idx = i
+        if re.search(r'Family\s+Name\s*\(Last\s*Name\)', line, re.I):
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                print(f"[Names line detected]: {next_line}")
+                parts = next_line.split()
+                if len(parts) >= 1:
+                    result['LastName'] = parts[0]
+                if len(parts) >= 2:
+                    result['FirstName'] = parts[1]
+                if len(parts) >= 3:
+                    result['MiddleName'] = parts[2]
+                print(f"[Names Detected]: {result['LastName']}, {result['FirstName']}, {result['MiddleName']}")
             break
-
-    if header_idx is not None and header_idx + 1 < len(lines):
-        # Take the next line after header as the name values
-        name_line = lines[header_idx + 1]
-        name_parts = name_line.split()
-        result['LastName'] = name_parts[0] if len(name_parts) > 0 else ''
-        result['FirstName'] = name_parts[1] if len(name_parts) > 1 else ''
-        result['MiddleName'] = name_parts[2] if len(name_parts) > 2 else ''
-        print(f"[Names Detected]: {result['LastName']}, {result['FirstName']}, {result['MiddleName']}")
 
     doc.close()
 
     # --------------------------------------------------------------
     # 7️⃣ Save JSON result to S3
     # --------------------------------------------------------------
-    input_filename = os.path.basename(key)
-    output_filename = os.path.splitext(input_filename)[0] + '.json'
+    input_filename = os.path.basename(str(key))
+    output_filename = input_filename.replace('.pdf', '.json')
     output_key = f'output/{output_filename}'
 
     s3.put_object(
@@ -102,7 +119,7 @@ def lambda_handler(event, context):
     print(f"[INFO] Extraction Result: {result}")
 
     # --------------------------------------------------------------
-    # 8️⃣ Return API Response with build version
+    # 8️⃣ Return API Response
     # --------------------------------------------------------------
     return {
         'statusCode': 200,
